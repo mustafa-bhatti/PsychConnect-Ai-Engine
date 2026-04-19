@@ -1,29 +1,23 @@
 """
 main.py — FastAPI microservice for the HTP Assessment Pipeline.
-
 Authentication: Google Vertex AI via service account JSON file.
-
 All configuration is driven by environment variables — see config.py.
-To change any setting, edit your .env file and restart the service.
-
-Running locally:
-  uvicorn main:app --reload --port 8000
-
-Running on Railway / Cloud Run:
-  Set all variables in the platform dashboard.  Railway auto-detects the Procfile.
 """
 
 import json
 import logging
+import asyncio
+from datetime import datetime
 from contextlib import asynccontextmanager
+import httpx
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from supabase import create_client, Client
 
 import config as cfg
-from schemas import PatientContext, AssessmentResponse, ErrorResponse
+from schemas import PatientContext, AssessmentRequest, ErrorResponse
 from pipeline import HTPPipeline
-import asyncio
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -32,197 +26,210 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ── Lifespan — initialise pipeline once at startup ─────────────────────────────
+# ── Globals ────────────────────────────────────────────────────────────────────
 pipeline: HTPPipeline | None = None
+supabase_client: Client | None = None
+assessment_queue: asyncio.Queue = asyncio.Queue()
 
+# ── Worker ─────────────────────────────────────────────────────────────────────
+def calculate_age(dob_str: str) -> int:
+    if not dob_str:
+        return 30 # Default if missing
+    try:
+        dob = datetime.fromisoformat(dob_str.replace("Z", "+00:00")).date()
+        today = datetime.now().date()
+        return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+    except Exception as e:
+        logger.warning(f"Error calculating age for dob {dob_str}: {e}")
+        return 30
 
+async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, str]:
+    if not url:
+        return None, None
+    logger.info(f"Downloading image from: {url}")
+    
+    # ── Security fix: Allow downloading from private Medical buckets ──
+    # If the bucket is accidentally or intentionally set to Private, the
+    # standard /public/ URL will return "Bucket not found" (404).
+    # We rewrite it to the authenticated endpoint and pass the Service Role key.
+    secure_url = url.replace("/object/public/", "/object/authenticated/")
+    headers = {
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": cfg.SUPABASE_SERVICE_ROLE_KEY
+    }
+    
+    response = await client.get(secure_url, headers=headers)
+    if response.status_code != 200:
+        logger.error(f"Failed to download image. Status: {response.status_code}, Body: {response.text}")
+        response.raise_for_status()
+    # Extract filename from url or just provide a default
+    filename = url.split("/")[-1].split("?")[0] or "image.jpg"
+    return response.content, filename
+
+async def process_assessment_task(assessment_id: str):
+    logger.info(f"Worker processing assessment: {assessment_id}")
+    
+    try:
+        # 1. Fetch assessment with patient info
+        resp = supabase_client.table("assessments").select("*, patients(*)").eq("id", assessment_id).execute()
+        if not resp.data:
+            raise ValueError(f"Assessment {assessment_id} not found in database.")
+        
+        assessment = resp.data[0]
+        patient    = assessment.get("patients", {})
+        if not patient:
+            raise ValueError(f"Patient not found for assessment {assessment_id}")
+
+        patient_id = assessment.get("patient_id")
+        
+        # 2. Extract questionnaire_scores jsonb which contains patient context
+        q_scores = assessment.get("questionnaire_scores", {}) or {}
+        
+        age = calculate_age(patient.get("date_of_birth"))
+        if age < 5:
+            age = 30  # Give a safe default if date_of_birth is missing or invalid
+        
+        gender_input = patient.get("gender") or "prefer_not_to_say"
+        # Force map custom string inputs onto our enum choices, or fallback
+        if gender_input.lower() not in ["male", "female", "other", "prefer_not_to_say"]:
+            gender_input = "other"
+            
+        # Build patient context enforcing schema constraints
+        patient_context = PatientContext(
+            patient_id=str(patient_id),
+            age=age,
+            gender=gender_input,
+            presenting_complaint=q_scores.get("presenting_complaint", "Patient presenting for psychological assessment."),
+            relevant_history=patient.get("medical_history") or q_scores.get("relevant_history"),
+            referral_source=q_scores.get("referral_source"),
+            phq9_score=q_scores.get("phq9_score"),
+            dass21=q_scores.get("dass21")
+        )
+
+        # 3. Download images
+        async with httpx.AsyncClient() as http_client:
+            house_bytes, house_name = await download_image(http_client, assessment.get("house_drawing_url"))
+            tree_bytes, tree_name = await download_image(http_client, assessment.get("tree_drawing_url"))
+            person_bytes, person_name = await download_image(http_client, assessment.get("person_drawing_url"))
+            ppat_bytes, ppat_name = None, None  # Optional, usually in ppat_drawing_url if it exists later
+
+        if not house_bytes or not tree_bytes or not person_bytes:
+            raise ValueError("Missing one or more required drawing URLs (House, Tree, Person).")
+
+        # 4. Process pipeline
+        logger.info(f"Running pipeline for {assessment_id}")
+        result = await pipeline.run_assessment(
+            patient_context=patient_context,
+            house_bytes=house_bytes, house_name=house_name,
+            tree_bytes=tree_bytes, tree_name=tree_name,
+            person_bytes=person_bytes, person_name=person_name,
+            ppat_bytes=ppat_bytes, ppat_name=ppat_name,
+        )
+
+        # 5. Success DB update
+        logger.info(f"Pipeline complete for {assessment_id}, saving to DB..")
+        supabase_client.table("assessments").update({
+            "status": "completed",
+            "ai_report_json": result.model_dump()
+        }).eq("id", assessment_id).execute()
+        logger.info(f"Assessment {assessment_id} finalized.")
+
+    except Exception as exc:
+        logger.exception(f"Pipeline error for assessment_id={assessment_id}")
+        # Failure DB update (omitting error column per user instructions)
+        try:
+            supabase_client.table("assessments").update({
+                "status": "failed"
+            }).eq("id", assessment_id).execute()
+        except Exception as update_exc:
+            logger.error(f"Failed to update assessment status to 'failed': {update_exc}")
+
+async def assessment_worker():
+    """Background task pulling from queue and processing sequentially."""
+    logger.info("Background assessment worker started.")
+    while True:
+        assessment_id = await assessment_queue.get()
+        try:
+            await process_assessment_task(assessment_id)
+        except Exception as e:
+            logger.error(f"Worker unhandled exception processing {assessment_id}: {e}")
+        finally:
+            assessment_queue.task_done()
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pipeline
+    global supabase_client
 
-    # Validate required config before touching any Google APIs
+    # Validate required config
     missing = [
-        name
-        for name, value in [
-            ("VERTEX_PROJECT_ID",           cfg.VERTEX_PROJECT_ID),
+        name for name, value in [
+            ("VERTEX_PROJECT_ID", cfg.VERTEX_PROJECT_ID),
             ("GOOGLE_APPLICATION_CREDENTIALS", cfg.CREDENTIALS_PATH),
-        ]
-        if not value
+            ("SUPABASE_URL", cfg.SUPABASE_URL),
+            ("SUPABASE_SERVICE_ROLE_KEY", cfg.SUPABASE_SERVICE_ROLE_KEY),
+        ] if not value
     ]
     if missing:
         msg = f"Missing required environment variables: {', '.join(missing)}"
         logger.error(msg)
         raise RuntimeError(msg)
 
-    logger.info(
-        "Starting HTP service — project=%s  location=%s  credentials=%s",
-        cfg.VERTEX_PROJECT_ID,
-        cfg.VERTEX_LOCATION,
-        cfg.CREDENTIALS_PATH,
-    )
-
-    try:
-        pipeline = HTPPipeline()
-        logger.info("HTP Pipeline initialised and ready.")
-    except (FileNotFoundError, RuntimeError) as exc:
-        logger.error("Startup failed: %s", exc)
-        raise
+    # Init clients
+    pipeline = HTPPipeline()
+    supabase_client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_SERVICE_ROLE_KEY)
+    
+    # Start background worker
+    worker_task = asyncio.create_task(assessment_worker())
+    logger.info("HTP Pipeline & Supabase initialized. Queue started.")
 
     yield  # Application runs here
 
     logger.info("HTP Service shutting down.")
-
+    worker_task.cancel()
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="PsychConnect — HTP Assessment Microservice",
-    description=(
-        "AI-assisted House-Tree-Person projective drawing analysis. "
-        "All outputs are assistive tools for licensed psychologists only. "
-        "This service never provides autonomous diagnoses."
-    ),
     version="2.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins    =cfg.ALLOWED_ORIGINS,
+    allow_origins=cfg.ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods    =["POST", "GET"],
-    allow_headers    =["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
 )
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-async def _read_and_validate_image(
-    file: UploadFile, field_name: str
-) -> tuple[bytes, str]:
-    contents = await file.read()
-    size_mb  = len(contents) / (1024 * 1024)
-
-    if size_mb > cfg.MAX_IMAGE_SIZE_MB:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=(
-                f"'{field_name}' exceeds {cfg.MAX_IMAGE_SIZE_MB} MB limit "
-                f"({size_mb:.1f} MB uploaded)."
-            ),
-        )
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=(
-                f"'{field_name}' must be an image file (JPEG, PNG, WEBP). "
-                f"Got: {file.content_type}"
-            ),
-        )
-    return contents, file.filename or field_name
-
-
 # ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.get("/health", tags=["System"])
 async def health_check():
-    """
-    Health check endpoint.
-    Railway / Cloud Run healthchecks should poll this.
-    Returns 200 only when the pipeline is fully initialised.
-    """
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline not initialised.")
+    if pipeline is None or supabase_client is None:
+        raise HTTPException(status_code=503, detail="Service not initialised.")
     return {
         "status"          : "ok",
         "service"         : "htp-assessment",
         "version"         : "2.1.0",
-        "vertex_project"  : cfg.VERTEX_PROJECT_ID,
-        "vertex_location" : cfg.VERTEX_LOCATION,
+        "queue_size"      : assessment_queue.qsize(),
     }
-
 
 @app.post(
     "/assess",
-    response_model=AssessmentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     responses={
-        400: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        415: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
     },
     tags=["Assessment"],
-    summary="Run full HTP assessment",
-    description=(
-        "Accepts House, Tree, and Person drawing images plus structured patient context. "
-        "PPAT drawing is optional. Returns individual drawing reports and an integrated "
-        "synthesis report. All outputs are AI-assistive only — not diagnostic."
-    ),
+    summary="Enqueue full HTP assessment",
 )
-async def run_assessment(
-    patient_context_json: str = Form(
-        ...,
-        description=(
-            "JSON string of PatientContext. "
-            "Fields: patient_id, age, gender, presenting_complaint, "
-            "relevant_history (optional), referral_source (optional), "
-            "phq9_score (optional), dass21 (optional: {depression, anxiety, stress})."
-        ),
-        example=json.dumps({
-            "patient_id"           : "uuid-from-your-platform",
-            "age"                  : 28,
-            "gender"               : "female",
-            "presenting_complaint" : "Persistent low mood and difficulty concentrating for 3 months",
-            "relevant_history"     : "Reports stressful work environment. No prior mental health treatment.",
-            "phq9_score"           : 14,
-            "dass21"               : {"depression": 18, "anxiety": 12, "stress": 20},
-        }),
-    ),
-    house_image  : UploadFile       = File(...,    description="House drawing. JPEG / PNG / WEBP, max 10 MB."),
-    tree_image   : UploadFile       = File(...,    description="Tree drawing."),
-    person_image : UploadFile       = File(...,    description="Person drawing."),
-    ppat_image   : UploadFile | None = File(None,  description="Optional PPAT drawing."),
-):
-    # Parse and validate patient context
-    try:
-        ctx_data        = json.loads(patient_context_json)
-        patient_context = PatientContext(**ctx_data)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid patient_context_json: {exc}",
-        )
-
-    # Read and validate images
-    house_bytes,  house_name  = await _read_and_validate_image(house_image,  "house_image")
-    tree_bytes,   tree_name   = await _read_and_validate_image(tree_image,   "tree_image")
-    person_bytes, person_name = await _read_and_validate_image(person_image, "person_image")
-
-    ppat_bytes, ppat_name = None, None
-    if ppat_image is not None:
-        ppat_bytes, ppat_name = await _read_and_validate_image(ppat_image, "ppat_image")
-
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline not initialised.")
-
-    try:
-        result = await pipeline.run_assessment(
-            patient_context=patient_context,
-            house_bytes    =house_bytes,   house_name    =house_name,
-            tree_bytes     =tree_bytes,    tree_name     =tree_name,
-            person_bytes   =person_bytes,  person_name   =person_name,
-            ppat_bytes     =ppat_bytes,    ppat_name     =ppat_name,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.exception(
-            "Pipeline error for patient_id=%s", patient_context.patient_id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Assessment pipeline error: {exc}",
-        )
-
-    return result
+async def enqueue_assessment(payload: AssessmentRequest):
+    if pipeline is None or supabase_client is None:
+        raise HTTPException(status_code=503, detail="Service not initialised.")
+    
+    await assessment_queue.put(payload.assessment_id)
+    logger.info(f"Enqueued assessment {payload.assessment_id}. Queue size: {assessment_queue.qsize()}")
+    
+    return {"message": "Assessment processing started."}

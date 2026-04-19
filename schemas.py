@@ -41,6 +41,13 @@ class DASS21Scores(BaseModel):
     stress     : Optional[int] = Field(None, ge=0, le=42, description="DASS-21 Stress subscale score")
 
 
+class AssessmentRequest(BaseModel):
+    """
+    Request payload to start an assessment via the background worker queue.
+    """
+    assessment_id: str = Field(..., description="The unique UUID of the assessment in the Supabase database.")
+
+
 class PatientContext(BaseModel):
     """
     All patient information collected BEFORE the HTP drawing session.
@@ -100,15 +107,6 @@ class DrawingFeatures(BaseModel):
 # ─────────────────────────────────────────────
 # API Request / Response
 # ─────────────────────────────────────────────
-
-class AssessmentRequest(BaseModel):
-    """
-    Sent as multipart/form-data from Next.js.
-    Images (house, tree, person, ppat) are uploaded as files.
-    patient_context is sent as a JSON string field.
-    """
-    patient_context : PatientContext
-
 
 class IndividualReport(BaseModel):
     drawing_type    : str
