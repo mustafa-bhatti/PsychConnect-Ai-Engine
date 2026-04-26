@@ -66,6 +66,26 @@ async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, st
     filename = url.split("/")[-1].split("?")[0] or "image.jpg"
     return response.content, filename
 
+async def upload_pdf_to_storage(pdf_bytes: bytes, assessment_id: str) -> str | None:
+    """Upload the generated PDF report to Supabase Storage and return the public URL."""
+    try:
+        bucket = cfg.SUPABASE_STORAGE_BUCKET
+        file_path = f"reports/{assessment_id}/htp_report.pdf"
+        
+        supabase_client.storage.from_(bucket).upload(
+            path=file_path,
+            file=pdf_bytes,
+            file_options={"content-type": "application/pdf", "upsert": "true"},
+        )
+        
+        # Get public URL
+        public_url = supabase_client.storage.from_(bucket).get_public_url(file_path)
+        logger.info(f"PDF uploaded to storage: {public_url}")
+        return public_url
+    except Exception as exc:
+        logger.error(f"Failed to upload PDF to storage: {exc}")
+        return None
+
 async def process_assessment_task(assessment_id: str):
     logger.info(f"Worker processing assessment: {assessment_id}")
     
@@ -111,26 +131,32 @@ async def process_assessment_task(assessment_id: str):
             house_bytes, house_name = await download_image(http_client, assessment.get("house_drawing_url"))
             tree_bytes, tree_name = await download_image(http_client, assessment.get("tree_drawing_url"))
             person_bytes, person_name = await download_image(http_client, assessment.get("person_drawing_url"))
-            ppat_bytes, ppat_name = None, None  # Optional, usually in ppat_drawing_url if it exists later
 
         if not house_bytes or not tree_bytes or not person_bytes:
             raise ValueError("Missing one or more required drawing URLs (House, Tree, Person).")
 
         # 4. Process pipeline
         logger.info(f"Running pipeline for {assessment_id}")
-        result = await pipeline.run_assessment(
+        result, pdf_bytes = await pipeline.run_assessment(
             patient_context=patient_context,
             house_bytes=house_bytes, house_name=house_name,
             tree_bytes=tree_bytes, tree_name=tree_name,
             person_bytes=person_bytes, person_name=person_name,
-            ppat_bytes=ppat_bytes, ppat_name=ppat_name,
         )
 
-        # 5. Success DB update
+        # 5. Upload PDF to Supabase Storage
+        pdf_url = await upload_pdf_to_storage(pdf_bytes, assessment_id)
+        
+        # 6. Update the result with PDF URL
+        result_dict = result.model_dump()
+        result_dict["pdf_report_url"] = pdf_url
+
+        # 7. Success DB update
         logger.info(f"Pipeline complete for {assessment_id}, saving to DB..")
         supabase_client.table("assessments").update({
             "status": "completed",
-            "ai_report_json": result.model_dump()
+            "ai_report_json": result_dict,
+            "pdf_report_url": pdf_url,
         }).eq("id", assessment_id).execute()
         logger.info(f"Assessment {assessment_id} finalized.")
 
@@ -192,7 +218,7 @@ async def lifespan(app: FastAPI):
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="PsychConnect — HTP Assessment Microservice",
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -212,7 +238,7 @@ async def health_check():
     return {
         "status"          : "ok",
         "service"         : "htp-assessment",
-        "version"         : "2.1.0",
+        "version"         : "3.0.0",
         "queue_size"      : assessment_queue.qsize(),
     }
 

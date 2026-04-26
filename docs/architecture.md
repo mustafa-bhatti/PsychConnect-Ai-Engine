@@ -6,7 +6,7 @@ This document describes the system architecture, pipeline design, and key techni
 
 ## System Overview
 
-The AI Engine is a **FastAPI microservice** that receives assessment requests from the PsychConnect Next.js frontend. It downloads patient drawings from Supabase Storage, runs them through a multi-phase Gemini AI pipeline, and writes the clinical report back to the database.
+The AI Engine is a **FastAPI microservice** that receives assessment requests from the PsychConnect Next.js frontend. It downloads patient drawings from Supabase Storage, runs them through a multi-phase Gemini AI pipeline, generates a branded PDF report, and writes the structured results back to the database.
 
 ```
 ┌─────────────────────┐       POST /assess        ┌──────────────────────────┐
@@ -23,6 +23,12 @@ The AI Engine is a **FastAPI microservice** that receives assessment requests fr
                                                    │  │  HTP Pipeline    │    │
                                                    │  │  (pipeline.py)   │    │
                                                    │  └────────┬─────────┘    │
+                                                   │           │              │
+                                                   │           ▼              │
+                                                   │  ┌──────────────────┐    │
+                                                   │  │  PDF Generator   │    │
+                                                   │  │  (pdf_report.py) │    │
+                                                   │  └──────────────────┘    │
                                                    └───────────┼──────────────┘
                                                                │
                          ┌─────────────────────────────────────┼──────────┐
@@ -37,6 +43,17 @@ The AI Engine is a **FastAPI microservice** that receives assessment requests fr
 
 ---
 
+## Two-Layer Output Design
+
+The pipeline produces **two distinct outputs**:
+
+| Layer | Format | Purpose | Storage |
+|-------|--------|---------|---------|
+| **Dashboard JSON** | Structured JSON | Quick-glance insights on psychologist dashboard | `ai_report_json` column |
+| **PDF Report** | Branded PDF | Detailed clinical document for download/records | Supabase Storage → `pdf_report_url` |
+
+---
+
 ## Request Lifecycle
 
 1. **Frontend** creates an `assessments` row in Supabase (status: `pending`) with drawing URLs
@@ -46,14 +63,13 @@ The AI Engine is a **FastAPI microservice** that receives assessment requests fr
 5. Worker **fetches** the assessment row + patient data from Supabase
 6. Worker **downloads** the drawing images from Supabase Storage (authenticated)
 7. Worker runs the **3-phase HTP Pipeline**
-8. Worker **updates** the assessment row with `ai_report_json` and `status: completed`
-9. On failure, worker sets `status: failed`
+8. Worker **generates a PDF report** from the pipeline outputs
+9. Worker **uploads the PDF** to Supabase Storage
+10. Worker **updates** the assessment row with `ai_report_json`, `pdf_report_url`, and `status: completed`
 
 ---
 
 ## Pipeline Phases
-
-The pipeline is designed for **maximum parallelism** and **cost efficiency**.
 
 ### Phase 1 — Feature Extraction (Parallel)
 
@@ -63,11 +79,9 @@ The pipeline is designed for **maximum parallelism** and **cost efficiency**.
 | **Input** | Drawing image only (no manual) |
 | **Output** | Structured JSON (`DrawingFeatures`) |
 | **Temperature** | 0.0 (deterministic) |
-| **Parallelism** | All 3-4 drawings processed simultaneously |
+| **Parallelism** | All 3 drawings processed simultaneously |
 
-Gemini Flash extracts raw visual features from each drawing: line quality, size, placement, omissions, shading, distortions, and clinical flags. The output schema is enforced via Gemini's `response_schema` parameter — no manual JSON parsing required.
-
-**Why no manual in Phase 1?** Feature extraction is purely observational. Sending the manual here would add cost without benefit, since interpretation happens in Phase 2.
+Gemini Flash extracts raw visual features from each drawing. The output schema is enforced via Gemini's `response_schema` parameter.
 
 ### Phase 2 — Individual Interpretation (Parallel)
 
@@ -75,122 +89,61 @@ Gemini Flash extracts raw visual features from each drawing: line quality, size,
 |-----------|-------|
 | **Model** | Gemini 2.5 Flash |
 | **Input** | Drawing image + extracted features + HTP manual (via context cache) |
-| **Output** | Structured clinical text report |
-| **Temperature** | 0.2 (slight creativity for interpretive language) |
-| **Parallelism** | All 3-4 drawings processed simultaneously |
+| **Output** | Clinical interpretation text (observations + themes + follow-up questions) |
+| **Temperature** | 0.2 |
+| **Parallelism** | All 3 drawings processed simultaneously |
 
-Each drawing gets its own clinical interpretation report, grounded in the HTP manual and the patient's demographic context. The manual is served from a Vertex AI **context cache** to save ~90% on input token costs.
+Phase 2 output serves **dual purpose**:
+- Used by Phase 3 to distill structured dashboard JSON
+- Included in the PDF report as detailed interpretation text
 
-### Phase 3 — Synthesis (Sequential)
+### Phase 3 — Synthesis (Structured JSON)
 
 | Attribute | Value |
 |-----------|-------|
 | **Model** | Gemini 2.5 Pro |
 | **Input** | All drawing images + all Phase 2 reports + HTP manual (via context cache) |
-| **Output** | Integrated clinical synthesis report |
+| **Output** | Structured JSON for dashboard (themes, observations, questionnaire correlation) |
 | **Temperature** | 0.2 |
-| **Parallelism** | Single call (needs all Phase 2 outputs) |
+| **Schema enforcement** | `response_mime_type="application/json"` |
 
-The Pro model synthesizes all individual reports into a comprehensive integrated assessment, cross-referencing findings across drawings and correlating with questionnaire scores (PHQ-9, DASS-21) when available.
+### PDF Generation (Local)
 
-### Performance
-
-```
-Sequential approach:  7× single-call latency  (old)
-Current approach:     ~3× single-call latency  (Phases 1+2 parallelized)
-```
+| Attribute | Value |
+|-----------|-------|
+| **Library** | fpdf2 (pure Python) |
+| **Input** | Phase 2 reports + Phase 3 synthesis + patient context |
+| **Output** | Branded clinical PDF (~5-10 pages) |
+| **Time** | ~1-2 seconds (no external API call) |
 
 ---
 
 ## Context Caching Strategy
 
-The HTP manual PDF (~19 MB) is registered as a **Vertex AI Context Cache** at startup.
-
-### How It Works
-
-1. On startup, the pipeline creates two caches:
-   - **Flash cache** — for Phase 2 (interpretation)
-   - **Pro cache** — for Phase 3 (synthesis)
-2. Each cache stores the full manual PDF server-side on Google's infrastructure
-3. Subsequent API calls reference the cache by name instead of re-uploading the PDF
-4. Vertex AI charges **10% of input-token price** for cached content (90% discount)
-
-### Cache Lifecycle
+The HTP manual PDF (~19 MB) is registered as a **Vertex AI Context Cache** at startup, providing a 90% discount on manual input tokens.
 
 | Parameter | Value |
 |-----------|-------|
-| TTL | 24 hours (`CACHE_TTL_SECONDS = 86400`) |
-| Max inline size | 10 MB (`CACHE_MAX_INLINE_MB`) |
-| GCS fallback | Set `HTP_MANUAL_GCS_URI` for manuals > 10 MB |
+| TTL | 24 hours |
+| Flash cache | Phase 2 (interpretation) |
+| Pro cache | Phase 3 (synthesis) |
 
-### Deduplication
-
-Before creating a new cache, the pipeline lists existing caches and reuses any with a matching `display_name`. This prevents duplicate caches from accumulating across restarts.
-
-### Graceful Fallback
-
-If cache creation fails (quota, permissions, region issues), the pipeline falls back to sending the manual PDF inline with every request. This is slower and more expensive but fully functional.
+Caches are deduplicated by `display_name` to prevent accumulation across restarts. Falls back gracefully to inline sending if caching fails.
 
 ---
 
 ## Background Worker
 
-The service uses a single `asyncio.Queue` + worker pattern:
+Sequential processing via `asyncio.Queue` to avoid overwhelming Vertex AI quotas:
 
-```python
-assessment_queue: asyncio.Queue = asyncio.Queue()
-
-async def assessment_worker():
-    while True:
-        assessment_id = await assessment_queue.get()
-        await process_assessment_task(assessment_id)
-        assessment_queue.task_done()
-```
-
-### Design Decisions
-
-- **Sequential processing** — Assessments are processed one at a time to avoid overwhelming Vertex AI quotas
-- **Fire-and-forget** — The `/assess` endpoint returns `202 Accepted` immediately
-- **Error isolation** — A failed assessment doesn't block the queue; the worker catches all exceptions and updates the database
-- **Queue size monitoring** — The `/health` endpoint reports current queue size
+- **Fire-and-forget** — `/assess` returns `202 Accepted` immediately
+- **Error isolation** — Failed assessments don't block the queue
+- **Queue monitoring** — `/health` reports current queue size
 
 ---
 
 ## Retry Strategy
 
-All Gemini API calls use exponential backoff with jitter:
+All Gemini API calls use exponential backoff: `wait = min(1.0 × 2^attempt + jitter, 60.0)`
 
-```
-wait = min(BASE_DELAY × 2^attempt + random(0, 1), MAX_DELAY)
-```
-
-| Parameter | Value |
-|-----------|-------|
-| Max attempts | 5 |
-| Base delay | 1.0s |
-| Max delay | 60.0s |
-| Timeout per call | 200s |
-
-**Only** `429` / `RESOURCE_EXHAUSTED` quota errors trigger retries. All other exceptions propagate immediately.
-
----
-
-## Security
-
-### Image Downloads
-
-Drawing images are stored in Supabase Storage. Even if a bucket is accidentally set to Private, the service rewrites public URLs to authenticated endpoints and passes the `SUPABASE_SERVICE_ROLE_KEY`:
-
-```python
-secure_url = url.replace("/object/public/", "/object/authenticated/")
-headers = {
-    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-}
-```
-
-### Patient Privacy
-
-- `patient_id` is used for audit logging and database joins only
-- It is **never** included in the body of clinical reports (Clinical Rule 7)
-- Patient names are never sent to the AI pipeline
+Only `429` / `RESOURCE_EXHAUSTED` errors trigger retries (max 5 attempts).

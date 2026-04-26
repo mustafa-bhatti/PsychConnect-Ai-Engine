@@ -66,7 +66,7 @@ async def main():
     print("Note: Phases will run in parallel using Vertex AI.\n")
 
     try:
-        result = await pipe.run_assessment(
+        result, pdf_bytes = await pipe.run_assessment(
             patient_context = TEST_PATIENT,
             house_bytes     = HOUSE_PATH.read_bytes(),   house_name  = HOUSE_PATH.name,
             tree_bytes      = TREE_PATH.read_bytes(),    tree_name   = TREE_PATH.name,
@@ -77,18 +77,45 @@ async def main():
         print(f"⏱️  Total Processing Time : {result.processing_time_seconds:.2f}s")
         print(f"🎯 Overall Confidence    : {result.overall_confidence}")
 
-        print("\n" + "="*20 + " SYNTHESIS REPORT " + "="*20)
-        print(result.synthesis_report)
+        # Display key themes
+        print("\n" + "="*20 + " KEY THEMES " + "="*20)
+        for theme in result.summary.key_themes:
+            icon = {"high": "🔴", "moderate": "🟡", "low": "🟢"}.get(theme.severity, "⚪")
+            print(f"  {icon} [{theme.severity.upper()}] {theme.theme}")
+            print(f"     Evidence: {theme.evidence}")
+        
+        # Display risk flags
+        if result.summary.risk_flags:
+            print("\n⚠️  RISK FLAGS:")
+            for flag in result.summary.risk_flags:
+                print(f"  🚩 {flag}")
+
+        # Display clinical impression
+        print("\n" + "="*20 + " CLINICAL IMPRESSION " + "="*20)
+        print(result.summary.clinical_impression)
         print("="*58)
 
-        # Save output for review
+        # Display session focus areas
+        print("\n📋 SESSION FOCUS AREAS:")
+        for i, area in enumerate(result.session_focus_areas, 1):
+            print(f"  {i}. {area}")
+
+        # Save JSON output
         output_path = Path("test_output.json")
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(result.model_dump(), f, indent=2, ensure_ascii=False)
-        print(f"\n💾 Full analysis result saved to: {output_path}")
+        print(f"\n💾 Dashboard JSON saved to: {output_path}")
+
+        # Save PDF output
+        pdf_path = Path("test_report.pdf")
+        pdf_path.write_bytes(pdf_bytes)
+        print(f"📄 PDF report saved to: {pdf_path}")
+        print(f"   PDF size: {len(pdf_bytes) / 1024:.1f} KB")
 
     except Exception as e:
         print(f"\n❌ Pipeline failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())

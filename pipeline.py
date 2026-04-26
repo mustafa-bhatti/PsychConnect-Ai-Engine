@@ -14,8 +14,10 @@ Phase 1 (parallel) : Gemini Flash — extract structured visual features from ea
 Phase 2 (parallel) : Gemini Flash — write a per-drawing clinical interpretation
                      report.  Manual served from context cache.
 Phase 3 (single)   : Gemini Pro   — synthesise all individual reports + all raw
-                     images into a final integrated clinical report.
+                     images into a structured dashboard JSON.
                      Manual served from context cache.
+PDF Generation     : After Phase 3, a branded clinical PDF is generated locally
+                     using fpdf2 (no external API call).
 
 Both Phase 1 and Phase 2 run with asyncio.gather — fully parallel.
 All API calls are wrapped in exponential back-off + jitter retry logic that
@@ -30,6 +32,7 @@ import random
 import mimetypes
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional, Any
 
 from google import genai
@@ -42,7 +45,17 @@ from google.genai.types import (
 )
 
 import config as cfg
-from schemas import DrawingFeatures, IndividualReport, AssessmentResponse, PatientContext
+from schemas import (
+    DrawingFeatures,
+    AssessmentResponse,
+    PatientContext,
+    ReportSummary,
+    ThemeItem,
+    DrawingSummary,
+    Observation,
+    QuestionnaireSummary,
+    QuestionnaireScore,
+)
 from prompts import (
     build_extraction_prompt,
     build_interpretation_prompt,
@@ -50,6 +63,7 @@ from prompts import (
     build_patient_context_summary,
     DISCLAIMER,
 )
+from pdf_report import generate_pdf_report
 
 logger = logging.getLogger(__name__)
 
@@ -376,31 +390,30 @@ class HTPPipeline:
         logger.info("Phase 2 — %s interpretation done.", features.drawing_type)
         return response.text
 
-    # ── Phase 3: Synthesis (Pro, cached manual + all images) ───────────────────
+    # ── Phase 3: Synthesis (Pro, structured JSON for dashboard) ─────────────────
 
     async def _synthesise(
         self,
-        reports: dict[str, tuple[DrawingFeatures, str]],
+        interpretations: dict[str, str],
         images: dict[str, tuple[bytes, str]],
         patient_context_summary: str,
-    ) -> str:
+    ) -> dict:
         """
         Sends all individual interpretation reports + all raw images to Gemini Pro
-        for the final integrated clinical synthesis.
+        for the final integrated clinical synthesis as structured JSON.
         The manual is served from the Pro context cache (if available).
         """
         prompt_text = build_synthesis_prompt(
-            house_report  = reports.get("House",  (None, ""))[1],
-            tree_report   = reports.get("Tree",   (None, ""))[1],
-            person_report = reports.get("Person", (None, ""))[1],
-            ppat_report   = reports.get("PPAT",   (None, ""))[1] if "PPAT" in reports else "",
+            house_report  = interpretations.get("House",  ""),
+            tree_report   = interpretations.get("Tree",   ""),
+            person_report = interpretations.get("Person", ""),
             patient_context_summary=patient_context_summary,
         )
 
         # Images sent in a fixed clinical order
         image_parts = [
             self._image_part(images[dt][0], images[dt][1])
-            for dt in ("House", "Tree", "Person", "PPAT")
+            for dt in ("House", "Tree", "Person")
             if dt in images
         ]
 
@@ -409,10 +422,14 @@ class HTPPipeline:
             gen_config = GenerateContentConfig(
                 temperature=0.2,
                 cached_content=self._pro_cache,
+                response_mime_type="application/json",
             )
         else:
             contents   = [self._manual_inline()] + image_parts + [types.Part.from_text(text=prompt_text)]
-            gen_config = GenerateContentConfig(temperature=0.2)
+            gen_config = GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+            )
 
         response = await self._call_with_retry(
             lambda: self.client.aio.models.generate_content(
@@ -424,7 +441,13 @@ class HTPPipeline:
         )
         self._log_usage("Phase3", "Synthesis", response)
         logger.info("Phase 3 — synthesis done.")
-        return response.text
+
+        try:
+            data = json.loads(response.text)
+            return data
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse Phase 3 JSON: %s", exc)
+            raise RuntimeError(f"Invalid Phase 3 response format: {exc}") from exc
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -437,15 +460,16 @@ class HTPPipeline:
         tree_name       : str,
         person_bytes    : bytes,
         person_name     : str,
-        ppat_bytes      : Optional[bytes] = None,
-        ppat_name       : Optional[str]   = None,
-    ) -> AssessmentResponse:
+    ) -> tuple[AssessmentResponse, bytes]:
         """
         Runs the full three-phase HTP assessment pipeline.
 
         Phase 1 and Phase 2 execute in parallel (asyncio.gather).
         Phase 3 is a single sequential call after Phase 2 completes.
-        All phases use exponential back-off retry on quota errors.
+        After Phase 3, a branded PDF report is generated locally.
+
+        Returns:
+            Tuple of (AssessmentResponse for dashboard JSON, PDF bytes)
         """
         start = time.perf_counter()
         patient_context_summary = build_patient_context_summary(patient_context)
@@ -456,8 +480,6 @@ class HTPPipeline:
             "Tree"  : (tree_bytes,   tree_name),
             "Person": (person_bytes, person_name),
         }
-        if ppat_bytes and ppat_name:
-            images["PPAT"] = (ppat_bytes, ppat_name)
 
         drawing_types = list(images.keys())
 
@@ -482,7 +504,7 @@ class HTPPipeline:
             "=== Phase 2 started — generating %d interpretation reports in parallel ===",
             len(images),
         )
-        interpretations: list[str] = await asyncio.gather(*[
+        interpretation_texts: list[str] = await asyncio.gather(*[
             self._interpret_drawing(
                 features               =features_map[dt],
                 image_bytes            =images[dt][0],
@@ -491,47 +513,113 @@ class HTPPipeline:
             )
             for dt in drawing_types
         ])
-        reports_map: dict[str, tuple[DrawingFeatures, str]] = {
-            dt: (features_map[dt], interpretations[i])
+        interpretations_map: dict[str, str] = {
+            dt: interpretation_texts[i]
             for i, dt in enumerate(drawing_types)
         }
         logger.info("=== Phase 2 complete ===")
 
-        # ── Phase 3: Synthesis ─────────────────────────────────────────────────
-        logger.info("=== Phase 3 started — generating synthesis report ===")
-        synthesis = await self._synthesise(reports_map, images, patient_context_summary)
+        # ── Phase 3: Synthesis (structured JSON) ──────────────────────────────
+        logger.info("=== Phase 3 started — generating structured synthesis ===")
+        synthesis_data = await self._synthesise(interpretations_map, images, patient_context_summary)
         logger.info("=== Phase 3 complete ===")
 
-        # ── Assemble response ──────────────────────────────────────────────────
+        # ── PDF Generation ────────────────────────────────────────────────────
+        logger.info("=== Generating PDF report ===")
+        pdf_bytes = generate_pdf_report(
+            patient_context_summary=patient_context_summary,
+            house_interpretation=interpretations_map.get("House", ""),
+            tree_interpretation=interpretations_map.get("Tree", ""),
+            person_interpretation=interpretations_map.get("Person", ""),
+            synthesis_data=synthesis_data,
+            features_map=features_map,
+        )
+        logger.info("=== PDF generation complete ===")
+
+        # ── Assemble dashboard response ───────────────────────────────────────
         elapsed            = round(time.perf_counter() - start, 2)
         overall_confidence = (
             sum(f.confidence_score for f in features_map.values()) / len(features_map)
             if features_map else 0.0
         )
-        low_conf_warning   = any(f.confidence_score < 0.50 for f in features_map.values())
 
-        def _make_report(dt: str) -> IndividualReport:
-            feat, interp = reports_map[dt]
-            return IndividualReport(drawing_type=dt, features=feat, interpretation=interp)
+        # Build drawing summaries from Phase 3 structured data
+        drawing_summaries = []
+        obs_keys = {
+            "House": "house_observations",
+            "Tree": "tree_observations",
+            "Person": "person_observations",
+        }
+        for dt in drawing_types:
+            obs_list = synthesis_data.get(obs_keys.get(dt, ""), [])
+            drawing_summaries.append(DrawingSummary(
+                drawing_type=dt,
+                confidence=features_map[dt].confidence_score,
+                observations=[
+                    Observation(
+                        feature=obs.get("feature", ""),
+                        interpretation=obs.get("interpretation", ""),
+                    )
+                    for obs in obs_list
+                ],
+            ))
+
+        # Build themes
+        key_themes = [
+            ThemeItem(
+                theme=t.get("theme", ""),
+                evidence=t.get("evidence", ""),
+                severity=t.get("severity", "moderate"),
+            )
+            for t in synthesis_data.get("key_themes", [])
+        ]
+
+        # Build questionnaire summary
+        q_summary = None
+        has_q = any(
+            synthesis_data.get(k) is not None
+            for k in ["phq9", "dass21_depression", "dass21_anxiety", "dass21_stress"]
+        )
+        if has_q:
+            def _build_q_score(key: str) -> Optional[QuestionnaireScore]:
+                raw = synthesis_data.get(key)
+                if raw is None:
+                    return None
+                return QuestionnaireScore(
+                    score=raw.get("score", 0),
+                    severity=raw.get("severity", "Unknown"),
+                    drawing_consistency=raw.get("drawing_consistency", "neutral"),
+                )
+
+            q_summary = QuestionnaireSummary(
+                phq9=_build_q_score("phq9"),
+                dass21_depression=_build_q_score("dass21_depression"),
+                dass21_anxiety=_build_q_score("dass21_anxiety"),
+                dass21_stress=_build_q_score("dass21_stress"),
+            )
 
         result = AssessmentResponse(
             patient_id              = patient_context.patient_id,
-            disclaimer              = DISCLAIMER,
-            house_report            = _make_report("House"),
-            tree_report             = _make_report("Tree"),
-            person_report           = _make_report("Person"),
-            ppat_report             = _make_report("PPAT") if "PPAT" in reports_map else None,
-            synthesis_report        = synthesis,
+            assessed_at             = datetime.now(timezone.utc).isoformat(),
             overall_confidence      = round(overall_confidence, 2),
-            low_confidence_warning  = low_conf_warning,
+            summary                 = ReportSummary(
+                clinical_impression = synthesis_data.get("clinical_impression", ""),
+                key_themes          = key_themes,
+                risk_flags          = synthesis_data.get("risk_flags", []),
+            ),
+            drawings                = drawing_summaries,
+            questionnaire_match     = q_summary,
+            session_focus_areas     = synthesis_data.get("session_focus_areas", []),
+            pdf_report_url          = None,  # Set by the worker after upload
             processing_time_seconds = elapsed,
+            disclaimer              = DISCLAIMER,
         )
 
         logger.info(
-            "Assessment complete — patient_id=%s  confidence=%.2f  time=%.2fs  low_conf_warning=%s",
+            "Assessment complete — patient_id=%s  confidence=%.2f  time=%.2fs  themes=%d",
             patient_context.patient_id,
             overall_confidence,
             elapsed,
-            low_conf_warning,
+            len(key_themes),
         )
-        return result
+        return result, pdf_bytes

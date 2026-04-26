@@ -22,6 +22,7 @@ CREDENTIALS_PATH  = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 # ── Supabase ───────────────────────────────────────────────────────────────────
 SUPABASE_URL              = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STORAGE_BUCKET   = os.environ.get("SUPABASE_STORAGE_BUCKET", "assessments")
 
 # ── Resources ──────────────────────────────────────────────────────────────────
 HTP_MANUAL_PATH = os.environ.get("HTP_MANUAL_PATH", "resources/book_htp_combined.pdf")
