@@ -65,11 +65,24 @@ class HTPReportPDF(FPDF):
         self.set_y(-17)
         self.set_font("Helvetica", "I", 6.5)
         self.set_text_color(*COLOR_MUTED)
-        self.cell(0, 4, "AI-assistive tool only — not for diagnosis without clinical review", align="L")
+        self.cell(0, 4, "AI-assistive tool only - not for diagnosis without clinical review", align="L")
         self.cell(0, 4, f"Page {self.page_no()}/{{nb}}", align="R", new_x="LMARGIN", new_y="NEXT")
+
+    def _ensure_space(self, min_height: float) -> None:
+        """
+        If there is less than `min_height` mm remaining on the current page
+        before the bottom margin, insert a page break now.
+        This prevents orphaned titles and cards that start at the bottom of a
+        page and push their content to the next page, leaving a blank gap.
+        """
+        remaining = self.h - self.b_margin - self.get_y()
+        if remaining < min_height:
+            self.add_page()
 
     def _section_title(self, title: str):
         """Render a styled section heading."""
+        # Require at least 35 mm so the title + first line of content fit together
+        self._ensure_space(35)
         self.ln(4)
         self.set_fill_color(*COLOR_PRIMARY)
         self.rect(10, self.get_y(), 3, 7, "F")
@@ -81,6 +94,8 @@ class HTPReportPDF(FPDF):
 
     def _subsection_title(self, title: str):
         """Render a smaller subsection heading."""
+        # Require at least 20 mm so subtitle + first observation row fit together
+        self._ensure_space(20)
         self.ln(2)
         self.set_font("Helvetica", "B", 10)
         self.set_text_color(*COLOR_SECONDARY)
@@ -161,7 +176,7 @@ class HTPReportPDF(FPDF):
         return lines
 
     def _observation_row(self, feature: str, interpretation: str):
-        """Render a feature -> interpretation row."""
+        """Render a feature to interpretation row."""
         feature = self._sanitize(feature)
         interpretation = self._sanitize(interpretation)
         y_start = self.get_y()
@@ -193,25 +208,26 @@ class HTPReportPDF(FPDF):
     def _risk_flag(self, flag_text: str):
         """Render a risk flag alert."""
         flag_text = self._sanitize(flag_text)
-        y = self.get_y()
-        self.set_fill_color(254, 226, 226)  # Red-100
-        self.set_draw_color(*COLOR_RED)
         self.set_font("Helvetica", "", 8)
         w = self.w - 2 * self.l_margin
         lines = self._estimate_lines(f"[!] {flag_text}", w - 6)
         h = max(lines * 4.5 + 6, 10)
+        # Ensure the whole box fits on this page
+        self._ensure_space(h + 4)
+        y = self.get_y()
+        self.set_fill_color(254, 226, 226)  # Red-100
+        self.set_draw_color(*COLOR_RED)
         self.rect(self.l_margin, y, w, h, "DF")
         self.set_xy(self.l_margin + 3, y + 3)
         self.set_text_color(*COLOR_RED)
         self.set_font("Helvetica", "B", 8)
         self.multi_cell(w - 6, 4.5, f"ALERT: {flag_text}")
-        self.set_y(y + h + 2)
+        self.set_y(max(self.get_y(), y + h) + 2)
 
     def _theme_card(self, theme: str, evidence: str, severity: str):
         """Render a theme card with severity badge."""
         theme    = self._sanitize(theme)
         evidence = self._sanitize(evidence)
-        y = self.get_y()
 
         # Severity colors
         sev_colors = {
@@ -221,16 +237,20 @@ class HTPReportPDF(FPDF):
         }
         text_c, bg_c = sev_colors.get(severity.lower(), sev_colors["moderate"])
 
-        # Card background
         w = self.w - 2 * self.l_margin
-        self.set_fill_color(*COLOR_LIGHT_BG)
-        self.set_draw_color(*COLOR_BORDER)
 
-        # Estimate height
+        # Estimate height with a 30% safety buffer to prevent content overflow
         self.set_font("Helvetica", "", 8)
         ev_lines = self._estimate_lines(evidence, w - 10)
-        h = 22 + ev_lines * 4.5
+        h = (22 + ev_lines * 4.5) * 1.3  # 30% buffer
 
+        # Ensure the whole card fits on this page before drawing the background rect
+        self._ensure_space(h + 4)
+        y = self.get_y()  # Re-read y AFTER potential page break
+
+        # Card background
+        self.set_fill_color(*COLOR_LIGHT_BG)
+        self.set_draw_color(*COLOR_BORDER)
         self.rect(self.l_margin, y, w, h, "DF")
 
         # Severity badge
@@ -249,13 +269,17 @@ class HTPReportPDF(FPDF):
         self.set_text_color(*COLOR_DARK)
         self.cell(0, 5, theme)
 
-        # Evidence
+        # Evidence — disable auto page-break while inside the card
         self.set_xy(self.l_margin + 5, y + 12)
         self.set_font("Helvetica", "", 8)
         self.set_text_color(*COLOR_TEXT)
+        prev_break = self.will_page_break(h)  # peek
+        self.set_auto_page_break(False)
         self.multi_cell(w - 10, 4.5, evidence)
+        self.set_auto_page_break(True, self.b_margin)
 
-        self.set_y(y + h + 3)
+        # Advance past the card (use whichever is lower: actual cursor or estimated end)
+        self.set_y(max(self.get_y(), y + h) + 3)
 
 
 def generate_pdf_report(
