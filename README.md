@@ -6,6 +6,23 @@ FastAPI microservice for the PsychConnect telepsychology platform.
 > **Clinical Notice**: All outputs are AI-assistive tools for licensed
 > psychologists only. This service never provides autonomous diagnoses.
 
+## 📖 Documentation
+
+Full documentation is available in the [`docs/`](./docs/) folder:
+
+| Document | Description |
+|----------|-------------|
+| [Getting Started](./docs/getting-started.md) | Installation, setup, and first run |
+| [Architecture](./docs/architecture.md) | System design, pipeline phases, and data flow |
+| [API Reference](./docs/api-reference.md) | HTTP endpoints and response schemas |
+| [Configuration](./docs/configuration.md) | Environment variables and tuning |
+| [Data Models](./docs/data-models.md) | Pydantic schemas and database tables |
+| [Clinical Rules](./docs/clinical-rules.md) | The 9 clinical safety rules |
+| [Prompt Engineering](./docs/prompt-engineering.md) | How AI prompts are structured |
+| [Deployment](./docs/deployment.md) | Docker, Railway, and Cloud Run guides |
+| [Testing](./docs/testing.md) | Local testing and validation |
+| [Contributing](./docs/contributing.md) | Code standards and PR workflow |
+
 ---
 
 ## Project Structure
