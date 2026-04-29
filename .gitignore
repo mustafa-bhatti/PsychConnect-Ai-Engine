@@ -2,3 +2,5 @@ psychconnect-key.json
 todo.md
 .env
 .github
+__pycache__
+venv

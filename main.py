@@ -110,8 +110,9 @@ async def process_assessment_task(assessment_id: str):
             age = 30  # Give a safe default if date_of_birth is missing or invalid
         
         gender_input = patient.get("gender") or "prefer_not_to_say"
+        gender_input = str(gender_input).lower()
         # Force map custom string inputs onto our enum choices, or fallback
-        if gender_input.lower() not in ["male", "female", "other", "prefer_not_to_say"]:
+        if gender_input not in ["male", "female", "other", "prefer_not_to_say"]:
             gender_input = "other"
             
         # Build patient context enforcing schema constraints
