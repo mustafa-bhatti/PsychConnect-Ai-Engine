@@ -23,12 +23,39 @@ CREDENTIALS_PATH  = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 if not CREDENTIALS_PATH and GOOGLE_CREDS_JSON:
     import tempfile
-    # Write credentials JSON string to a temporary file
+    import json
+    
     temp_creds_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
-    with open(temp_creds_path, "w", encoding="utf-8") as f:
-        f.write(GOOGLE_CREDS_JSON)
+    creds_str = GOOGLE_CREDS_JSON.strip()
+    
+    # Clean up outer quotes if wrapped by the environment config
+    if (creds_str.startswith("'") and creds_str.endswith("'")) or (creds_str.startswith('"') and creds_str.endswith('"')):
+        creds_str = creds_str[1:-1].strip()
+        
+    try:
+        # Parse JSON to validate and format it
+        json_data = json.loads(creds_str)
+    except json.JSONDecodeError:
+        try:
+            # Handle double-escaped sequences if present
+            cleaned_str = creds_str.encode().decode('unicode_escape')
+            if (cleaned_str.startswith('"') and cleaned_str.endswith('"')):
+                cleaned_str = cleaned_str[1:-1].strip()
+            json_data = json.loads(cleaned_str)
+        except Exception:
+            json_data = None
+
+    if json_data:
+        with open(temp_creds_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2)
+    else:
+        # Fallback to writing the raw string directly
+        with open(temp_creds_path, "w", encoding="utf-8") as f:
+            f.write(GOOGLE_CREDS_JSON)
+            
     CREDENTIALS_PATH = temp_creds_path
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_creds_path
+
 
 
 # ── Supabase ───────────────────────────────────────────────────────────────────
