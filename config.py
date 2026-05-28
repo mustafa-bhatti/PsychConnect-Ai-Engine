@@ -19,42 +19,36 @@ VERTEX_PROJECT_ID = os.environ.get("VERTEX_PROJECT_ID", "")
 VERTEX_LOCATION   = os.environ.get("VERTEX_LOCATION", "global")
 CREDENTIALS_PATH  = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-# Support loading credentials from raw JSON string in env (for platforms like Railway)
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
-if not CREDENTIALS_PATH and GOOGLE_CREDS_JSON:
+# Support loading credentials from individual standard env variables (for platforms like Railway)
+GOOGLE_CLIENT_EMAIL = os.environ.get("GOOGLE_CLIENT_EMAIL", "")
+GOOGLE_PRIVATE_KEY  = os.environ.get("GOOGLE_PRIVATE_KEY", "")
+
+if not CREDENTIALS_PATH and GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY:
     import tempfile
     import json
     
-    temp_creds_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
-    creds_str = GOOGLE_CREDS_JSON.strip()
+    # Clean up and format the private key to resolve escaped newlines
+    private_key = GOOGLE_PRIVATE_KEY.strip()
+    if (private_key.startswith("'") and private_key.endswith("'")) or (private_key.startswith('"') and private_key.endswith('"')):
+        private_key = private_key[1:-1]
+    private_key = private_key.replace("\\n", "\n")
     
-    # Clean up outer quotes if wrapped by the environment config
-    if (creds_str.startswith("'") and creds_str.endswith("'")) or (creds_str.startswith('"') and creds_str.endswith('"')):
-        creds_str = creds_str[1:-1].strip()
+    creds_dict = {
+        "type": "service_account",
+        "project_id": VERTEX_PROJECT_ID,
+        "private_key": private_key,
+        "client_email": GOOGLE_CLIENT_EMAIL,
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "universe_domain": "googleapis.com"
+    }
+    
+    temp_creds_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
+    with open(temp_creds_path, "w", encoding="utf-8") as f:
+        json.dump(creds_dict, f, indent=2)
         
-    try:
-        # Parse JSON to validate and format it
-        json_data = json.loads(creds_str)
-    except json.JSONDecodeError:
-        try:
-            # Handle double-escaped sequences if present
-            cleaned_str = creds_str.encode().decode('unicode_escape')
-            if (cleaned_str.startswith('"') and cleaned_str.endswith('"')):
-                cleaned_str = cleaned_str[1:-1].strip()
-            json_data = json.loads(cleaned_str)
-        except Exception:
-            json_data = None
-
-    if json_data:
-        with open(temp_creds_path, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=2)
-    else:
-        # Fallback to writing the raw string directly
-        with open(temp_creds_path, "w", encoding="utf-8") as f:
-            f.write(GOOGLE_CREDS_JSON)
-            
     CREDENTIALS_PATH = temp_creds_path
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_creds_path
+
 
 
 
