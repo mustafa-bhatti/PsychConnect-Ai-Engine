@@ -252,7 +252,7 @@ class HTPPipeline:
             getattr(u, "total_token_count",      "?"),
         )
 
-    async def _call_with_retry(self, coro_fn, label: str = "", timeout_seconds: float = 200.0) -> Any:
+    async def _call_with_retry(self, coro_fn, label: str = "", timeout_seconds: float = 600.0) -> Any:
         """
         Calls an async callable with exponential back-off + random jitter and a timeout.
 

@@ -19,6 +19,18 @@ VERTEX_PROJECT_ID = os.environ.get("VERTEX_PROJECT_ID", "")
 VERTEX_LOCATION   = os.environ.get("VERTEX_LOCATION", "global")
 CREDENTIALS_PATH  = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 
+# Support loading credentials from raw JSON string in env (for platforms like Railway)
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
+if not CREDENTIALS_PATH and GOOGLE_CREDS_JSON:
+    import tempfile
+    # Write credentials JSON string to a temporary file
+    temp_creds_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
+    with open(temp_creds_path, "w", encoding="utf-8") as f:
+        f.write(GOOGLE_CREDS_JSON)
+    CREDENTIALS_PATH = temp_creds_path
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_creds_path
+
+
 # ── Supabase ───────────────────────────────────────────────────────────────────
 SUPABASE_URL              = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
