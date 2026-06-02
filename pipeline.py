@@ -43,6 +43,7 @@ from google.genai.types import (
     Content,
     HttpOptions,
 )
+from google.genai.errors import ClientError
 
 import config as cfg
 from schemas import (
@@ -141,7 +142,15 @@ class HTPPipeline:
         mime = "application/pdf" if p.suffix.lower() == ".pdf" else "text/plain"
         return p.read_bytes(), mime
 
-    def _create_cache(self, model_name: str, display_name: str) -> Optional[str]:
+    def _delete_cache_silently(self, cache_name: str) -> None:
+        """Deletes a cache by name, ignoring any errors."""
+        try:
+            logger.info("Deleting invalid context cache: %s", cache_name)
+            self.client.caches.delete(name=cache_name)
+        except Exception as exc:
+            logger.warning("Failed to delete cache %s: %s", cache_name, exc)
+
+    def _create_cache(self, model_name: str, display_name: str, force: bool = False) -> Optional[str]:
         """
         Registers the HTP manual as a Vertex AI Context Cache for the given model.
 
@@ -156,13 +165,14 @@ class HTPPipeline:
         the manual inline with each request.
         """
         # ── Prevent creating duplicate caches to save money ────────────────────
-        try:
-            for existing_cache in self.client.caches.list():
-                if existing_cache.display_name == display_name:
-                    logger.info("Found existing context cache — model=%s  name=%s", model_name, existing_cache.name)
-                    return existing_cache.name
-        except Exception as exc:
-            logger.warning("Failed to list existing caches: %s", exc)
+        if not force:
+            try:
+                for existing_cache in self.client.caches.list():
+                    if existing_cache.display_name == display_name:
+                        logger.info("Found existing context cache — model=%s  name=%s", model_name, existing_cache.name)
+                        return existing_cache.name
+            except Exception as exc:
+                logger.warning("Failed to list existing caches: %s", exc)
 
         size_mb = len(self.manual_bytes) / (1024 * 1024)
 
@@ -359,36 +369,63 @@ class HTPPipeline:
             patient_context_summary=patient_context_summary,
         )
 
-        if self._flash_cache:
-            # Manual is in the cache — contents only need the image + prompt
-            contents   = [
-                self._image_part(image_bytes, filename),
-                types.Part.from_text(text=prompt_text),
-            ]
-            gen_config = GenerateContentConfig(
-                temperature=0.2,
-                cached_content=self._flash_cache,
-            )
-        else:
-            # Fallback: send the manual inline (original behaviour)
-            contents   = [
-                self._manual_inline(),
-                self._image_part(image_bytes, filename),
-                types.Part.from_text(text=prompt_text),
-            ]
-            gen_config = GenerateContentConfig(temperature=0.2)
+        use_cache = bool(self._flash_cache)
 
-        response = await self._call_with_retry(
-            lambda: self.client.aio.models.generate_content(
-                model=cfg.FLASH_MODEL,
-                contents=contents,
-                config=gen_config,
-            ),
-            label=f"Phase2/{features.drawing_type}",
-        )
-        self._log_usage("Phase2", features.drawing_type, response)
-        logger.info("Phase 2 — %s interpretation done.", features.drawing_type)
-        return response.text
+        for attempt in range(2):
+            if use_cache and self._flash_cache:
+                # Manual is in the cache — contents only need the image + prompt
+                contents   = [
+                    self._image_part(image_bytes, filename),
+                    types.Part.from_text(text=prompt_text),
+                ]
+                gen_config = GenerateContentConfig(
+                    temperature=0.2,
+                    cached_content=self._flash_cache,
+                )
+            else:
+                # Fallback: send the manual inline (original behaviour)
+                contents   = [
+                    self._manual_inline(),
+                    self._image_part(image_bytes, filename),
+                    types.Part.from_text(text=prompt_text),
+                ]
+                gen_config = GenerateContentConfig(temperature=0.2)
+
+            try:
+                response = await self._call_with_retry(
+                    lambda: self.client.aio.models.generate_content(
+                        model=cfg.FLASH_MODEL,
+                        contents=contents,
+                        config=gen_config,
+                    ),
+                    label=f"Phase2/{features.drawing_type}",
+                )
+                self._log_usage("Phase2", features.drawing_type, response)
+                logger.info("Phase 2 — %s interpretation done.", features.drawing_type)
+                return response.text
+            except Exception as exc:
+                is_cache_not_found = isinstance(exc, ClientError) and (
+                    "cached content" in str(exc).lower() or
+                    "404" in str(exc)
+                )
+                if is_cache_not_found and use_cache and attempt == 0:
+                    logger.warning(
+                        "Flash cache %s was not found (likely expired). Re-creating and retrying...",
+                        self._flash_cache
+                    )
+                    if self._flash_cache:
+                        self._delete_cache_silently(self._flash_cache)
+                    
+                    new_cache = self._create_cache(cfg.FLASH_MODEL, "htp-manual-flash", force=True)
+                    if new_cache:
+                        self._flash_cache = new_cache
+                    else:
+                        logger.warning("Failed to recreate Flash cache. Falling back to inline manual.")
+                        self._flash_cache = None
+                        use_cache = False
+                    continue
+                else:
+                    raise
 
     # ── Phase 3: Synthesis (Pro, structured JSON for dashboard) ─────────────────
 
@@ -417,37 +454,64 @@ class HTPPipeline:
             if dt in images
         ]
 
-        if self._pro_cache:
-            contents   = image_parts + [types.Part.from_text(text=prompt_text)]
-            gen_config = GenerateContentConfig(
-                temperature=0.2,
-                cached_content=self._pro_cache,
-                response_mime_type="application/json",
-            )
-        else:
-            contents   = [self._manual_inline()] + image_parts + [types.Part.from_text(text=prompt_text)]
-            gen_config = GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-            )
+        use_cache = bool(self._pro_cache)
 
-        response = await self._call_with_retry(
-            lambda: self.client.aio.models.generate_content(
-                model=cfg.PRO_MODEL,
-                contents=contents,
-                config=gen_config,
-            ),
-            label="Phase3/Synthesis",
-        )
-        self._log_usage("Phase3", "Synthesis", response)
-        logger.info("Phase 3 — synthesis done.")
+        for attempt in range(2):
+            if use_cache and self._pro_cache:
+                contents   = image_parts + [types.Part.from_text(text=prompt_text)]
+                gen_config = GenerateContentConfig(
+                    temperature=0.2,
+                    cached_content=self._pro_cache,
+                    response_mime_type="application/json",
+                )
+            else:
+                contents   = [self._manual_inline()] + image_parts + [types.Part.from_text(text=prompt_text)]
+                gen_config = GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                )
 
-        try:
-            data = json.loads(response.text)
-            return data
-        except json.JSONDecodeError as exc:
-            logger.error("Failed to parse Phase 3 JSON: %s", exc)
-            raise RuntimeError(f"Invalid Phase 3 response format: {exc}") from exc
+            try:
+                response = await self._call_with_retry(
+                    lambda: self.client.aio.models.generate_content(
+                        model=cfg.PRO_MODEL,
+                        contents=contents,
+                        config=gen_config,
+                    ),
+                    label="Phase3/Synthesis",
+                )
+                self._log_usage("Phase3", "Synthesis", response)
+                logger.info("Phase 3 — synthesis done.")
+
+                try:
+                    data = json.loads(response.text)
+                    return data
+                except json.JSONDecodeError as exc:
+                    logger.error("Failed to parse Phase 3 JSON: %s", exc)
+                    raise RuntimeError(f"Invalid Phase 3 response format: {exc}") from exc
+            except Exception as exc:
+                is_cache_not_found = isinstance(exc, ClientError) and (
+                    "cached content" in str(exc).lower() or
+                    "404" in str(exc)
+                )
+                if is_cache_not_found and use_cache and attempt == 0:
+                    logger.warning(
+                        "Pro cache %s was not found (likely expired). Re-creating and retrying...",
+                        self._pro_cache
+                    )
+                    if self._pro_cache:
+                        self._delete_cache_silently(self._pro_cache)
+                    
+                    new_cache = self._create_cache(cfg.PRO_MODEL, "htp-manual-pro", force=True)
+                    if new_cache:
+                        self._pro_cache = new_cache
+                    else:
+                        logger.warning("Failed to recreate Pro cache. Falling back to inline manual.")
+                        self._pro_cache = None
+                        use_cache = False
+                    continue
+                else:
+                    raise
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
